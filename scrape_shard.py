@@ -1,14 +1,16 @@
 """Fetch one shard of barcodes from go-upc.com and parse the product pages.
 
 Measured go-upc limits (GitHub runner IPs, 2026-11-18):
-  * 30 search requests per fresh egress IP, then HTTP 429.
-  * spacing below ~1 s also triggers a short burst 429.
-So a job takes at most `--size` 30 codes, one request per `--interval` second.
+  * a fresh egress IP gets ~30 search requests, some pooled runner IPs fewer;
+  * spacing below ~1 s also triggers a short burst 429;
+  * a quota 429 does not clear within 45 s, so retrying it only burns the slot.
+
+A job therefore aborts as soon as the IP shows it is exhausted, and marks the
+codes it did not reach as `blocked`, which leaves them pending for the next
+pass.
 
 Writes out/<shard>.json:
   {"shard": N, "egress": ip, "records": [{"code", "http", "sec", "result"}]}
-where result.status is one of found / not_found / invalid / blocked / unknown.
-Anything not found|not_found|invalid is retried by import_gh.py (left pending).
 """
 import argparse
 import json
@@ -31,33 +33,12 @@ HEADERS = {
 
 
 def egress_ip(session):
-    for _ in range(3):
+    for _ in range(2):
         try:
-            return session.get('https://api.ipify.org', timeout=10).text.strip()
+            return session.get('https://api.ipify.org', timeout=8).text.strip()
         except Exception:
             time.sleep(1)
     return ''
-
-
-def fetch(session, code, interval, retries=2):
-    """Return (http_status, body). Retries once after a 429 cooldown."""
-    for attempt in range(retries + 1):
-        t0 = time.time()
-        try:
-            r = session.get(f'https://go-upc.com/search?q={code}',
-                            timeout=(10, 45))
-            if r.status_code == 429 and attempt < retries:
-                print(f'  429 on {code}; cooling 45s (attempt {attempt + 1})',
-                      flush=True)
-                time.sleep(45)
-                continue
-            return str(r.status_code), r.text, round(time.time() - t0, 2)
-        except Exception as e:
-            if attempt < retries:
-                time.sleep(5)
-                continue
-            return 'ERR', str(e)[:150], round(time.time() - t0, 2)
-    return '429', '', 0.0
 
 
 def main():
@@ -69,9 +50,8 @@ def main():
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent
-    codes_path = root / args.codes
-    codes = [l.strip() for l in codes_path.read_text(encoding='utf-8').splitlines()
-             if l.strip()]
+    codes = [l.strip() for l in (root / args.codes).read_text(encoding='utf-8')
+             .splitlines() if l.strip()]
     start = args.shard * args.size
     shard_codes = codes[start:start + args.size]
     if not shard_codes:
@@ -85,23 +65,59 @@ def main():
 
     records = []
     t_start = time.time()
+    stop_reason = None
+    conn_fail = 0
+
     for i, code in enumerate(shard_codes, 1):
-        status, body, sec = fetch(session, code, args.interval)
+        if stop_reason:
+            records.append({'code': code, 'http': None,
+                            'result': {'status': 'blocked',
+                                       'queried_code': code}})
+            continue
+
+        sec = 0.0
+        status = 'ERR'
+        body = ''
+        for attempt in (1, 2):
+            t0 = time.time()
+            try:
+                r = session.get(f'https://go-upc.com/search?q={code}',
+                                timeout=(6, 20))
+                sec = round(time.time() - t0, 2)
+                status, body = str(r.status_code), r.text
+                break
+            except Exception as e:
+                sec = round(time.time() - t0, 2)
+                status = 'ERR'
+                body = str(e)[:150]
+                if attempt == 1:
+                    time.sleep(2)
+
         rec = {'code': code, 'http': status, 'sec': sec, 'result': None}
         if status == '200':
             rec['result'] = parse_product(body, code)
+            conn_fail = 0
         elif status == '400':
             rec['result'] = {'status': 'invalid', 'queried_code': code}
+            conn_fail = 0
         elif status == '429':
             rec['result'] = {'status': 'blocked', 'queried_code': code}
+            stop_reason = 'quota'
         else:
             rec['result'] = {'status': 'unknown', 'queried_code': code,
                              'snippet': f'{status} {str(body)[:100]}'}
+            conn_fail += 1
+            if conn_fail >= 2:
+                stop_reason = 'connection'
+
         records.append(rec)
         st = rec['result'].get('status')
         print(f'  {i:2d}/{len(shard_codes)} {code} http={status} {st} {sec}s',
               flush=True)
-        if i < len(shard_codes):
+        if stop_reason:
+            print(f'  stop: {stop_reason}; remaining codes left pending',
+                  flush=True)
+        elif i < len(shard_codes):
             time.sleep(args.interval)
 
     out_dir = root / 'out'
@@ -110,6 +126,7 @@ def main():
         'shard': args.shard,
         'egress': ip,
         'size': args.size,
+        'stop': stop_reason,
         'elapsed': round(time.time() - t_start, 1),
         'started': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'records': records,
@@ -121,8 +138,8 @@ def main():
     for r in records:
         s = (r['result'] or {}).get('status', 'none')
         counts[s] = counts.get(s, 0) + 1
-    print(f'shard {args.shard} done: {counts} elapsed={payload["elapsed"]}s',
-          flush=True)
+    print(f'shard {args.shard} done: {counts} stop={stop_reason} '
+          f'elapsed={payload["elapsed"]}s', flush=True)
     return 0
 
 
