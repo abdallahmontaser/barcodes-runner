@@ -1,0 +1,77 @@
+name: scrape
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: 'JSON array of shard numbers (max 256)'
+        required: true
+      size:
+        description: 'codes per shard (max 30)'
+        required: false
+        default: '30'
+      interval:
+        description: 'seconds between requests'
+        required: false
+        default: '1.0'
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: python -m pip install --quiet --no-warn-script-location cryptography
+      - name: Scrape shard ${{ matrix.shard }}
+        env:
+          CODES_KEY: ${{ secrets.CODES_KEY }}
+        run: |
+          python decrypt_codes.py
+          python scrape_shard.py --shard ${{ matrix.shard }} \
+            --size ${{ inputs.size }} --interval ${{ inputs.interval }}
+      - name: Upload shard result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s-${{ matrix.shard }}
+          path: out/${{ matrix.shard }}.json
+          retention-days: 1
+          if-no-files-found: warn
+
+  collect:
+    needs: scrape
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: s-*
+          path: shards
+          merge-multiple: true
+      - name: Merge
+        run: |
+          python - <<'EOF'
+          import glob, json, pathlib
+          recs = []
+          files = sorted(glob.glob('shards/*.json'))
+          for p in files:
+              try:
+                  recs.extend(json.loads(pathlib.Path(p).read_text())['records'])
+              except Exception as e:
+                  print('skip', p, e)
+          pathlib.Path('merged.json').write_text(
+              json.dumps({'files': len(files), 'records': recs},
+                         ensure_ascii=False),
+              encoding='utf-8')
+          print(f'merged {len(files)} files, {len(recs)} records')
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: batch
+          path: merged.json
+          retention-days: 3
